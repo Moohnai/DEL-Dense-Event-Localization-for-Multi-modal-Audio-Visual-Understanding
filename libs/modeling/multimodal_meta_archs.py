@@ -7,7 +7,7 @@ from torch.nn import functional as F
 from .models import (register_multimodal_meta_arch, make_multimodal_backbone, 
                     make_dependency_block)
 from .multimodal_backbones import Alignment
-from .blocks_multimodal import MaskedConv1D, Scale, LayerNorm
+from .blocks import MaskedConv1D, Scale, LayerNorm
 from .losses import ctr_diou_loss_1d, sigmoid_focal_loss
 
 from ..utils import batched_nms
@@ -73,8 +73,8 @@ class Dual_Contrastive_Loss(nn.Module):
         inter_contrastive_loss = (inter_contrastive_loss_video + inter_contrastive_loss_text) / 2
         
         ########## Intra-Sample Contrastive Loss ##########
-        intra_contrastive_loss = torch.zeros(1).to(device)
-        for i in range(len(key_video_list)):
+        intra_contrastive_loss = 0
+        for i in range(B):
             intra_contrastive_loss_video = self.NCE_video(
                 torch.mean(key_video_list[i], dim=0, keepdim=True),
                 torch.mean(key_text_list[i], dim=0, keepdim=True),
@@ -89,9 +89,9 @@ class Dual_Contrastive_Loss(nn.Module):
             )
             intra_contrastive_loss += (intra_contrastive_loss_video + intra_contrastive_loss_text) / 2
         if reduce == 'mean':
-            inter_contrastive_loss /= len(key_video_list)
+            inter_contrastive_loss /= B
         elif reduce == 'sum':
-            intra_contrastive_loss /= 1
+            intra_contrastive_loss /= B
         else:
             raise ValueError('Unknown reduction type')
         
@@ -110,8 +110,7 @@ class PtTransformerClsHead(nn.Module):
         prior_prob=0.01,
         num_layers=3,
         kernel_size=3,
-        # act_layer=nn.ReLU,
-        act_layer=nn.GELU,
+        act_layer=nn.ReLU,
         with_ln=False,
         empty_cls = [],
     ):
@@ -192,8 +191,7 @@ class PtTransformerRegHead(nn.Module):
         fpn_levels,
         num_layers=3,
         kernel_size=3,
-        # act_layer=nn.ReLU,
-        act_layer=nn.GELU,
+        act_layer=nn.ReLU,
         with_ln=False,
         class_aware=False
     ):
@@ -256,8 +254,7 @@ class PtTransformerRegHead(nn.Module):
                 cur_out, _ = self.head[idx](cur_out, cur_mask)
                 cur_out = self.act(self.norm[idx](cur_out))
             cur_offsets, _ = self.offset_head(cur_out, cur_mask)
-            # out_offsets += (F.relu(self.scale[l](cur_offsets)), ) 
-            out_offsets += (F.gelu(self.scale[l](cur_offsets)), ) 
+            out_offsets += (F.relu(self.scale[l](cur_offsets)), ) 
 
         return out_offsets
 
@@ -338,26 +335,26 @@ class PtTransformer(nn.Module):
         self.test_nms_sigma = test_cfg['nms_sigma']
         self.test_voting_thresh = test_cfg['voting_thresh']
 
-        # backbone network: conv + transformer 
+        # backbone network: conv + transformer
         assert backbone_type in ['convTransformer']
-        # self.backbone = make_multimodal_backbone(
-        #     'convTransformer',
-        #     **{
-        #         'n_in_V' : input_dim_V,
-        #         'n_in_A' : input_dim_A,
-        #         'n_embd' : embd_dim,
-        #         'n_head': n_head,
-        #         'n_embd_ks': embd_kernel_size,
-        #         'max_len': max_seq_len,
-        #         'arch' : backbone_arch,
-        #         'scale_factor' : scale_factor,
-        #         'with_ln' : embd_with_ln,
-        #         'attn_pdrop' : 0.0,
-        #         'proj_pdrop' : self.train_dropout,
-        #         'path_pdrop' : self.train_droppath,
-        #         'use_abs_pe' : use_abs_pe,
-        #     }
-        # )
+        self.backbone = make_multimodal_backbone(
+            'convTransformer',
+            **{
+                'n_in_V' : input_dim_V,
+                'n_in_A' : input_dim_A,
+                'n_embd' : embd_dim,
+                'n_head': n_head,
+                'n_embd_ks': embd_kernel_size,
+                'max_len': max_seq_len,
+                'arch' : backbone_arch,
+                'scale_factor' : scale_factor,
+                'with_ln' : embd_with_ln,
+                'attn_pdrop' : 0.0,
+                'proj_pdrop' : self.train_dropout,
+                'path_pdrop' : self.train_droppath,
+                'use_abs_pe' : use_abs_pe,
+            }
+        )
 
         assert dependency_type in ['DependencyBlock']
         if self.use_dependency:
@@ -373,11 +370,9 @@ class PtTransformer(nn.Module):
             )
         
         # classfication and regerssion heads
-        head_num_layers = 1
-        self.fpn_strides = [1]
         self.cls_head = PtTransformerClsHead(
             embd_dim*2,
-            head_dim*2, self.num_classes,  
+            head_dim, self.num_classes,  
             kernel_size=head_kernel_size,
             prior_prob=self.train_cls_prior_prob,
             with_ln=head_with_ln,
@@ -386,7 +381,7 @@ class PtTransformer(nn.Module):
         )
         self.reg_head = PtTransformerRegHead(
             embd_dim*2,
-            head_dim*2, self.num_classes, 
+            head_dim, self.num_classes, 
             len(self.fpn_strides),
             kernel_size=head_kernel_size,
             num_layers=head_num_layers,
@@ -399,9 +394,18 @@ class PtTransformer(nn.Module):
         self.loss_normalizer = train_cfg['init_loss_norm']
         self.loss_normalizer_momentum = 0.9
 
+        ### m:
+        # self.alignment_list = nn.ModuleList()
+        # for l, level_dim in enumerate([224, 112, 56, 28, 14, 7]):
+        #     self.alignment_list.append(
+        #         Alignment(
+        #             video_dim=512,
+        #             audio_dim=512,
+        #         )
+        #     )
         self.alignment = Alignment(
-                    video_dim=768,#2048
-                    audio_dim=768,#128
+                    video_dim=2048,#512
+                    audio_dim=128,#512
                 )
         
         self.contrastive_losses = Dual_Contrastive_Loss()
@@ -439,14 +443,32 @@ class PtTransformer(nn.Module):
             m_scores_gt = batched_scores,
             m_labels = batched_m_labels,
         )
+
+
+        #########
+        # forward the backbone
+        # feats_V, feats_A, masks = self.backbone(batched_inputs_V, batched_inputs_A, batched_masks) 
+        #######m:input: tensor:[B,2048,224],[B,128,224],[B,1,224] 
+        # out feats_V(tuple): [B, 512, 224], ..., [B, 512, 7]; feats_A(tuple): [B, 512, 224], ..., [B, 512, 7]; masks: [B, 1, 224], ..., [B, 1, 7]
+        
         
         ####m: alignment to yolo
-        # feats_V, feats_A, masks = self.backbone(feats_V_aligned[0], feats_A_aligned[0], batched_masks)
+        feats_V, feats_A, masks = self.backbone(feats_V_aligned[0], feats_A_aligned[0], batched_masks)
+
+        ####
+        # feats_V_aligned, feats_A_aligned = self.alignment(
+        #     video=feats_V, 
+        #     text=feats_A, 
+        #     mask_video=masks, 
+        #     mask_text=masks
+        # )
+        ####m: output: V:type:list, len=6, [B, 512, 224](tensor),...,[B,512,7] ---- A:type:list, len=6,...samw as V
 
         #concat audio and visual output features (B, C, T)->(B, 2C, T)
-        # feats_AV = [torch.cat((V, A), 1) for _, (V, A) in enumerate(zip(feats_V, feats_A))]
-        feats_AV = [torch.cat((feats_V_aligned[0], feats_A_aligned[0]), 1)]
-        masks = [batched_masks]
+        # feats_AV = [torch.cat((V, A), 1) for _, (V, A) in enumerate(zip(feats_V_aligned, feats_A_aligned))]
+        feats_AV = [torch.cat((V, A), 1) for _, (V, A) in enumerate(zip(feats_V, feats_A))]
+
+        #######m: feats_AV: [8, 1024, 224], ..., [8, 1024, 7]
 
         # dependency block
         if self.use_dependency:
@@ -488,14 +510,7 @@ class PtTransformer(nn.Module):
 
         # return loss during training
         if self.training:
-            new_losses = {}
-            for k, v in losses.items():
-                if isinstance(v, float):
-                    new_losses[k] = torch.tensor(v).to(gt_offsets)
-                else:
-                    new_losses[k] = v
-
-            return new_losses
+            return losses
 
         else:
 
@@ -504,18 +519,7 @@ class PtTransformer(nn.Module):
                 video_list, fpn_masks,
                 out_cls_logits, out_offsets
             )
-            # unsqueeze the 
-            new_losses = {}
-            for k, v in losses.items():
-                if isinstance(v, torch.Tensor):
-                    new_losses[k] = v.unsqueeze(0)
-                elif isinstance(v, float):
-                    new_losses[k] = torch.tensor(v).unsqueeze(0).to(self.device)
-            # add the losses to the results with losses key
-            results.update(new_losses)
-            # print(new_losses)
-
-            return results
+            return results, losses
 
     @torch.no_grad()
     def preprocessing(self, video_list, padding_val=0.0):
@@ -621,13 +625,13 @@ class PtTransformer(nn.Module):
         # 1. classification loss
         # stack the list -> (B, FT) -> (# Valid, )
         # gt_cls = torch.stack(gt_cls_labels)
-        gt_cls = gt_cls_labels # [B, 4536, 20]
-        pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask) # [B, 4536]
+        gt_cls = gt_cls_labels
+        pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask)
         
         # cat the predicted offsets -> (B, FT, 2 (xC)) -> # (#Pos, 2 (xC))
-        pred_offsets = torch.cat(out_offsets, dim=1)[pos_mask] # [74, 2]
+        pred_offsets = torch.cat(out_offsets, dim=1)[pos_mask] 
         # gt_offsets = torch.stack(gt_offsets)[pos_mask]
-        gt_offsets = gt_offsets[pos_mask] # [74, 2]
+        gt_offsets = gt_offsets[pos_mask] 
 
         # update the loss normalizer
         num_pos = pos_mask.sum().item()
@@ -636,7 +640,7 @@ class PtTransformer(nn.Module):
         ) * max(num_pos, 1)
 
         # gt_cls is already one hot encoded now, simply masking out
-        gt_target = gt_cls[valid_mask] # [5959, 20]
+        gt_target = gt_cls[valid_mask]
 
         # optinal label smoothing
         gt_target *= 1 - self.train_label_smoothing

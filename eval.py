@@ -6,7 +6,6 @@ import time
 from pprint import pprint
 
 # torch imports
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
@@ -15,11 +14,11 @@ import torch.utils.data
 # our code
 from libs.core import load_config
 from libs.datasets import make_dataset, make_data_loader
-from libs.modeling import make_meta_arch
+from libs.modeling import make_multimodal_meta_arch
 from libs.utils import valid_one_epoch, ANETdetection, fix_random_seed
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-
-################################################################################
 def main(args):
     """0. load config"""
     # sanity check
@@ -27,22 +26,22 @@ def main(args):
         cfg = load_config(args.config)
     else:
         raise ValueError("Config file does not exist.")
-    assert len(cfg['val_split']) > 0, "Test set must be specified!"
+    assert len(cfg['test_split']) > 0, "Test set must be specified!"
     if ".pth.tar" in args.ckpt:
         assert os.path.isfile(args.ckpt), "CKPT file does not exist!"
         ckpt_file = args.ckpt
     else:
         assert os.path.isdir(args.ckpt), "CKPT file folder does not exist!"
-        if args.epoch > 0:
-            ckpt_file = os.path.join(
-                args.ckpt, 'epoch_{:03d}.pth.tar'.format(args.epoch)
-            )
-        else:
-            ckpt_file_list = sorted(glob.glob(os.path.join(args.ckpt, '*.pth.tar')))
-            ckpt_file = ckpt_file_list[-1]
-        assert os.path.exists(ckpt_file)
+        ckpt_file_list = sorted(glob.glob(os.path.join(args.ckpt, '*.pth.tar')))
+        ckpt_file = ckpt_file_list[-1]
 
-    if args.t > 0:
+    ### M:
+    # cfg['num_workers'] = 1
+    # cfg['devices'] = ['cuda:1']
+    # cfg['loader']['batch_size'] = 32
+    ###
+
+    if args.topk > 0:
         cfg['model']['test_cfg']['max_seg_num'] = args.topk
     pprint(cfg)
 
@@ -52,21 +51,13 @@ def main(args):
 
     """2. create dataset / dataloader"""
     val_dataset = make_dataset(
-        cfg['dataset_name'], False, cfg['val_split'], **cfg['dataset']
+        cfg['dataset_name'], False, cfg['test_split'], **cfg['dataset']
     )
-    # set bs = 1, and disable shuffle
     val_loader = make_data_loader(
-        val_dataset, False, None, 1, cfg['loader']['num_workers']
-    )
+        val_dataset, False, None, **cfg['loader'], **cfg["dataset"])
 
     """3. create model and evaluator"""
-    # model
-    model = make_meta_arch(cfg['model_name'], **cfg['model'])
-
-    pytorch_total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total number of parameters: {pytorch_total_params}")
-    
-    # not ideal for multi GPU training, ok for now
+    model = make_multimodal_meta_arch(cfg['model_name'], **cfg['model'])
     model = nn.DataParallel(model, device_ids=cfg['devices'])
 
     """4. load ckpt"""
@@ -74,8 +65,7 @@ def main(args):
     # load ckpt, reset epoch / best rmse
     checkpoint = torch.load(
         ckpt_file,
-        # map_location = lambda storage, loc: storage.cuda(cfg['devices'][0])
-        map_location = lambda storage, loc: storage.cuda(3)
+        map_location = lambda storage, loc: storage.cuda(int(cfg['devices'][0].replace('cuda:', '')))
     )
     # load ema model instead
     print("Loading from EMA model ...")
@@ -89,12 +79,11 @@ def main(args):
         det_eval = ANETdetection(
             val_dataset.json_file,
             val_dataset.split[0],
-            tiou_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9] #val_db_vars['tiou_thresholds']
+            tiou_thresholds = val_db_vars['tiou_thresholds'],
+            # num_workers = cfg['num_workers'], ## M:
         )
     else:
         output_file = os.path.join(os.path.split(ckpt_file)[0], 'eval_results.pkl')
-
-    np.random.seed(0)
 
     """5. Test the model"""
     print("\nStart testing model {:s} ...".format(cfg['model_name']))
@@ -107,8 +96,7 @@ def main(args):
         output_file=output_file,
         ext_score_file=cfg['test_cfg']['ext_score_file'],
         tb_writer=None,
-        # print_freq=args.print_freq
-        print_freq=args.p
+        print_freq=args.print_freq
     )
     end = time.time()
     print("All done! Total time: {:0.2f} sec".format(end - start))
@@ -120,18 +108,15 @@ if __name__ == '__main__':
     # the arg parser
     parser = argparse.ArgumentParser(
       description='Train a point-based transformer for action localization')
-    parser.add_argument('--config', type=str, default='/home/mona/actionformer_release_lave/configs/anet_i3d.yaml',
+    parser.add_argument('--config', type=str, default="/home/mona/new/UnAV_yolyolVA/configs/avel_unav100.yaml",
                         help='path to a config file')
-    parser.add_argument('--ckpt', type=str, default='/home/mona/actionformer_release_lave/ckpt/anet_i3d_2025-05-15 18:14:35/epoch_015.pth.tar',
+    parser.add_argument('--ckpt', type=str, default='/home/mona/new/UnAV_yolyolVA/ckpt/no_contrastive/model_best.pth.tar',
                         help='path to a checkpoint')
-    parser.add_argument('--epoch', type=int, default=-1,
-                        help='checkpoint epoch')
-    parser.add_argument('--t', '--topk', default=-1, type=int,
+    parser.add_argument('--topk', default=-1, type=int,
                         help='max number of output actions (default: -1)')
     parser.add_argument('--saveonly', action='store_true',
                         help='Only save the ouputs without evaluation (e.g., for test set)')
-    parser.add_argument('--p', '--print-freq', default=10, type=int,
+    parser.add_argument('--print-freq', default=10, type=int,
                         help='print frequency (default: 10 iterations)')
     args = parser.parse_args()
     main(args)
- 

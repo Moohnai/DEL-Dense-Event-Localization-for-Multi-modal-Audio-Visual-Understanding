@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import time
 import pickle
@@ -16,7 +17,6 @@ from .postprocessing import postprocess_results
 from ..modeling import MaskedConv1D, Scale, AffineDropPath, LayerNorm
 
 
-################################################################################
 def fix_random_seed(seed, include_cuda=True):
     rng_generator = torch.manual_seed(seed)
     np.random.seed(seed)
@@ -32,6 +32,7 @@ def fix_random_seed(seed, include_cuda=True):
         # this is needed for CUDA >= 10.2
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         torch.use_deterministic_algorithms(True, warn_only=True)
+        # torch.set_deterministic(True) 
     else:
         cudnn.enabled = True
         cudnn.benchmark = True
@@ -43,12 +44,14 @@ def save_checkpoint(state, is_best, file_folder,
     """save checkpoint to file"""
     if not os.path.exists(file_folder):
         os.mkdir(file_folder)
-    torch.save(state, os.path.join(file_folder, file_name))
     if is_best:
         # skip the optimization / scheduler state
         state.pop('optimizer', None)
         state.pop('scheduler', None)
         torch.save(state, os.path.join(file_folder, 'model_best.pth.tar'))
+        # torch.save(state, os.path.join(file_folder, file_name))
+    else:
+        torch.save(state, os.path.join(file_folder, file_name))
 
 
 def print_model_params(model):
@@ -70,12 +73,12 @@ def make_optimizer(model, optimizer_config):
 
     # loop over all modules / params
     for mn, m in model.named_modules():
-        for pn, p in m.named_parameters(recurse=False):
+        for pn, p in m.named_parameters():
             fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
             if pn.endswith('bias'):
                 # all biases will not be decayed
                 no_decay.add(fpn)
-            elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules) and fpn not in no_decay:
+            elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
                 # weights of whitelist modules will be weight decayed
                 decay.add(fpn)
             elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
@@ -84,22 +87,10 @@ def make_optimizer(model, optimizer_config):
             elif pn.endswith('scale') and isinstance(m, (Scale, AffineDropPath)):
                 # corner case of our scale layer
                 no_decay.add(fpn)
-            elif pn.endswith('rel_pe'):
-                # corner case for relative position encoding
-                no_decay.add(fpn)
-            elif 'alignment' in mn:
+            ###m:
+            elif 'alignment' in pn:
                 decay.add(fpn)
-            elif 'chiz' in mn and pn.endswith('weight') and fpn not in no_decay:
-                no_decay.add(fpn)
-            elif 'chiz' in mn and pn.endswith('scale') and fpn not in decay and fpn not in no_decay:
-                decay.add(fpn)
-            elif ('pos_embd' in pn or 'pos_embd' in mn) and 'vid_pos_embd' not in pn and 'vid_pos_embd' not in mn and 'text_pos_embd' not in pn and 'text_pos_embd' not in mn:
-                decay.add(fpn)
-            elif ('vid_pos_embd' in pn or 'vid_pos_embd' in mn) and fpn not in decay:
-                no_decay.add(fpn)
-            elif ('text_pos_embd' in pn or 'text_pos_embd' in mn) and fpn not in decay:
-                no_decay.add(fpn)
-            elif 'logit_scale' in pn or 'logit_scale' in mn:
+            elif 'contrastive' in pn:
                 no_decay.add(fpn)
 
     # validate that we considered every parameter
@@ -259,7 +250,8 @@ class ModelEma(torch.nn.Module):
         self._update(model, update_fn=lambda e, m: m)
 
 
-################################################################################
+
+
 def train_one_epoch(
     train_loader,
     model,
@@ -284,10 +276,16 @@ def train_one_epoch(
     print("\n[Train]: Epoch {:d} started".format(curr_epoch))
     start = time.time()
     for iter_idx, video_list in enumerate(train_loader, 0):
+        # if iter_idx == 21:
+        #     break
         # zero out optim
         optimizer.zero_grad(set_to_none=True)
         # forward / backward the model
         losses = model(video_list)
+        if len(model.device_ids) > 1:
+            for k, v in losses.items():
+                if v is not None:
+                    losses[k] = v.mean()
         losses['final_loss'].backward()
         # gradient cliping (to stabilize training if necessary)
         if clip_grad_l2norm > 0.0:
@@ -367,7 +365,14 @@ def train_one_epoch(
     # finish up and print
     lr = scheduler.get_last_lr()[0]
     print("[Train]: Epoch {:d} finished with lr={:.8f}\n".format(curr_epoch, lr))
-    return
+    # return
+    return {'cls_loss':losses['cls_loss'], 
+            'reg_loss':losses['reg_loss'], 
+            'final_loss':losses['final_loss'],
+            'inter_contr_loss':losses['inter_contr_loss'],
+            'intra_contr_loss':losses['intra_contr_loss'],
+            'score_loss_video':losses['score_loss_video'],
+            'score_loss_audio':losses['score_loss_audio']}
 
 
 def valid_one_epoch(
@@ -378,7 +383,7 @@ def valid_one_epoch(
     evaluator = None,
     output_file = None,
     tb_writer = None,
-    print_freq = 20
+    print_freq = 2 ##
 ):
     """Test the model on the validation set"""
     # either evaluate the results or save the results
@@ -394,7 +399,8 @@ def valid_one_epoch(
         't-start' : [],
         't-end': [],
         'label': [],
-        'score': []
+        'score': [],
+        'gt_label': []
     }
 
     # loop over validation set
@@ -402,23 +408,39 @@ def valid_one_epoch(
     for iter_idx, video_list in enumerate(val_loader, 0):
         # forward the model (wo. grad)
         with torch.no_grad():
-            output = model(video_list)
+            output, losses = model(video_list)
 
-            # unpack the results into ANet format
-            num_vids = len(output)
+            if len(model.device_ids) > 1:
+                for k, v in losses.items():
+                    if v is not None:
+                        losses[k] = v.mean()
+
+            # Replace the video_id with the original video_id
+            output['video_id'] = video_list['video_id']
+
+            # upack the results into ANet format
+            # get the max index in last dimension
+            gt = video_list['gt_cls_labels'].argmax(dim=-1)
+            num_vids = len(output['video_id'])
             for vid_idx in range(num_vids):
-                if output[vid_idx]['segments'].shape[0] > 0:
+                if output['segments'][vid_idx].shape[0] > 0:
                     results['video-id'].extend(
-                        [output[vid_idx]['video_id']] *
-                        output[vid_idx]['segments'].shape[0]
+                        [output['video_id'][vid_idx]] *
+                        output['segments'][vid_idx].shape[0]
                     )
-                    results['t-start'].append(output[vid_idx]['segments'][:, 0])
-                    results['t-end'].append(output[vid_idx]['segments'][:, 1])
-                    results['label'].append(output[vid_idx]['labels'])
-                    results['score'].append(output[vid_idx]['scores'])
+                    results['t-start'].append(output['segments'][vid_idx][:, 0])
+                    results['t-end'].append(output['segments'][vid_idx][:, 1])
+                    results['label'].append(output['labels'][vid_idx])
+                    results['score'].append(output['scores'][vid_idx])
+                    results['gt_label'].append(gt[vid_idx])
+                    if '8UCxl9IRR7k' in output['video_id'][vid_idx] \
+                        or 'yQQG03dAoLU' in output['video_id'][vid_idx] \
+                        or '0K4QM63pY-w' in output['video_id'][vid_idx]:
+                        a=0
+                    print(f"ID: {output['video_id'][vid_idx]}\nLABLE: {output['labels'][vid_idx][:7]}\nSCORE: {output['scores'][vid_idx][:7]}\nSEGMENTS: {output['segments'][vid_idx][:7]}")
 
         # printing
-        if (iter_idx != 0) and iter_idx % (print_freq) == 0:
+        if (iter_idx != 0) and iter_idx % (print_freq) == 0: 
             # measure elapsed time (sync all kernels)
             torch.cuda.synchronize()
             batch_time.update((time.time() - start) / print_freq)
@@ -430,16 +452,17 @@ def valid_one_epoch(
                   iter_idx, len(val_loader), batch_time=batch_time))
 
     # gather all stats and evaluate
-    results['t-start'] = torch.cat(results['t-start']).numpy()
-    results['t-end'] = torch.cat(results['t-end']).numpy()
-    results['label'] = torch.cat(results['label']).numpy()
-    results['score'] = torch.cat(results['score']).numpy()
+    results['t-start'] = torch.cat(results['t-start']).detach().cpu().numpy()
+    results['t-end'] = torch.cat(results['t-end']).detach().cpu().numpy()
+    results['label'] = torch.cat(results['label']).detach().cpu().numpy()
+    results['score'] = torch.cat(results['score']).detach().cpu().numpy()
+    results['gt_label'] = torch.cat(results['gt_label']).detach().cpu().numpy()
 
     if evaluator is not None:
-        if ext_score_file is not None and isinstance(ext_score_file, str):
+        if (ext_score_file is not None) and isinstance(ext_score_file, str):
             results = postprocess_results(results, ext_score_file)
         # call the evaluator
-        _, mAP, _ = evaluator.evaluate(results, verbose=True)
+        _, mAP = evaluator.evaluate(results, verbose=True)
     else:
         # dump to a pickle file that can be directly used for evaluation
         with open(output_file, "wb") as f:
@@ -450,4 +473,8 @@ def valid_one_epoch(
     if tb_writer is not None:
         tb_writer.add_scalar('validation/mAP', mAP, curr_epoch)
 
-    return mAP
+    return mAP, losses
+
+def debugger_is_active() -> bool:
+    """Return if the debugger is currently active"""
+    return hasattr(sys, 'gettrace') and sys.gettrace() is not None

@@ -1,0 +1,43 @@
+dataset_name: unav100
+dataset: {
+  # json_file: /mnt/welles/scratch/mona/unav100/unav100_annotations.json,
+  json_file: /home/mona/unav_100_annotations_ident.json,
+  feat_folder: /mnt/welles/scratch/datasets/unav100/all_features, # mix all features together
+  file_prefix: ~,
+  file_ext: .npy,
+  max_seq_len: 224,  
+}
+model: {
+  input_dim_V: 512, #2048
+  input_dim_A: 512, #128
+  use_abs_pe: True,  
+  class_aware: True, 
+  use_dependency: False, #True
+  intra_contr_weight: 0.0,
+  inter_contr_weight: 0.000,
+  score_V_weight: 0.000,
+  score_A_weight: 0.000,
+}
+opt: {
+  learning_rate: 0.0001, 
+  epochs: 40,  
+  weight_decay: 0.0001, 
+  warmup_epochs: 5, 
+}
+loader: {
+  batch_size: 32, #16
+}
+train_cfg: {
+  loss_weight: 1, 
+  evaluate: True,
+  eval_freq: 2,
+}
+test_cfg: {
+  pre_nms_topk: 2000,
+  max_seg_num: 100, 
+  min_score: 0.001,
+  multiclass_nms: True,
+  nms_sigma : 0.4,
+  iou_threshold: 0.7,
+}
+output_folder: /home/mona/new/UnAV_yolyolVA/ckpt/
